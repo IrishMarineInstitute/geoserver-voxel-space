@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>wms Voxel Space</title>
+    <meta charset="UTF-8">
+    <meta name="description" content="wms 3d Voxel Space">
+    <meta name="author" content="Irish Marine Institute, John Hawthorn and Sebastian Macke">
+    <meta name="keywords" content="wms, Voxel, VoxelSpace, Voxel Space, Comanche, landscape, rendering">
+    <script src="hillshade.js"></script>
+    <style>
+        html, body {margin: 0; height: 100%; overflow: hidden}
+        canvas { width: 100%; height: 100%; }
+        a { color: white; }
+        #info {
+            position: absolute;
+            top: 0px;
+            width: 100%;
+            padding: 5px;
+            z-index:100;
+            color: white;
+            font-family: "Arial", Times, serif;
+            font-size: 120%;
+            }
+        #fps {
+            float: right;
+            position: absolute;
+            top: 0px;
+            right: 10px;
+            z-index:100;
+            padding: 5px;
+            color: white;
+            font-family: "Arial", Times, serif;
+            font-size: 120%;
+            }
+    </style>
+</head>
+
+<body scroll="no">
+
+<div id="fps">
+</div>
+
+
+<div id="info">
+    Fly controls
+    <b>WASD</b> or <b>Cursor Keys</b> or <b>left click</b> move, <b>R|F</b> up | down, <b>Q|E</b> pitch,
+<br>
+
+<label for="distancerange">Distance</label>
+<input id="distancerange" type="range" min="100" max="2000" step="1" onchange="camera.distance = this.value">
+<a href="https://github.com/IrishMarineInstitute/geoserver-voxel-space">Project Information</a>
+</div>
+
+<canvas id="myCanvas" width="800" height="400">
+    Your browser does not support the canvas element.
+</canvas>
+
+
+<script>
+"use strict";
+
+// ---------------------------------------------
+// Viewer information
+
+var camera =
+{
+    x:        512., // x position on the map
+    y:        512., // y position on the map
+    height:   80., // height of the camera
+    angle:      0., // direction of the camera
+    horizon:  100., // horizon position (look up and down)
+    distance: 800,//256   // distance of map
+};
+
+// ---------------------------------------------
+// Landscape data
+
+var map =
+{
+    width:    1024,
+    height:   1024,
+    shift:    8, //10,  // power of two: 2^10 = 1024 must correspond with your width in color_url and height_url
+    hillshade: true,
+    zfactor: 200
+};
+var wms = {
+  //bbox will be appended to url to fetch images
+  color_url: "https://geoserver.demo.marine.ie/geoserver/cite/wms?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&FORMAT=image%2Fpng&TRANSPARENT=true&tiled=true&STYLES&LAYERS=cite%3ASubstrate_colour_WGS84_Google_5m&WIDTH=256&HEIGHT=256&SRS=EPSG%3A4326&BBOX=",
+  height_url: "https://geoserver.demo.marine.ie/geoserver/cite/wms?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&FORMAT=image%2Fpng8&TRANSPARENT=true&tiled=true&STYLES&LAYERS=cite%3ABathymetry_Saltees_WGS84_Google_5m&WIDTH=256&HEIGHT=256&SRS=EPSG%3A4326&BBOX=",
+
+  lat_min: 52.11144752715927,
+  lat_max: 52.19187679592095,
+  lat_start: 52.12,
+  lat_step: -.005, //.3333333,
+  lon_start: -6.450,
+  lon_min: -6.604316064782158,
+  lon_max: -6.434206487643388,
+  lon_step: .005,
+}
+
+var getwmsExtents = function(x,y){
+  var extents = {
+    lat:{
+      min: wms.lat_start + y * wms.lat_step,
+      max: wms.lat_start + y * wms.lat_step + wms.lat_step
+    },
+    lon:{
+      min: wms.lon_start + x * wms.lon_step,
+      max: wms.lon_start + x * wms.lon_step + wms.lon_step
+    }
+  }
+  if(extents.lat.min > extents.lat.max){
+    var tmp = extents.lat.min;
+    extents.lat.min = extents.lat.max;
+    extents.lat.max = tmp;
+  }
+  if(extents.lon.min > extents.lon.max){
+    var tmp = extents.lon.min;
+    extents.lon.min = extents.lon.max;
+    extents.lon.max = tmp;
+  }
+  return extents;
+}
+
+/*
+ * Return zero, one or more image urls for the given position
+ */
+var getUrlsForImage = function(x,y){
+  var e = getwmsExtents(x,y);
+  if(e.lon.max < wms.lon_min
+     || e.lon.min > wms.lon_max
+     || e.lat.max < wms.lat_min
+     || e.lat.min > wms.lat_max){
+       console.log("out of bounds",e);
+       return null;
+     }
+     var bbox = [e.lon.min,e.lat.min,e.lon.max,e.lat.max].join(",");
+    var hash = "#"+x+","+y;
+    var urls = [wms.color_url+bbox+hash,wms.height_url+bbox+hash];
+    return urls;
+}
+
+function imagesToTile(images,x,y) {
+  var datac = images[0];
+  var datah = images.length == 1? images[0]: images[1];
+  var tile = {
+        altitude: new Uint8Array(map.width*map.height), // 1024 * 1024 byte array with height information
+        color:    new Uint32Array(map.width*map.height), // 1024 * 1024 int array with RGB colors
+        // for debug...
+        wms: getwmsExtents(x,y),
+        x: x,
+        y: y
+  };
+  for(var i=0; i<map.width*map.height; i++)
+  {
+    tile.altitude[i] = datah[i<<2] ;
+    tile.color[i] = (0xFF000000 | (datac[(i<<2) + 2] << 16) | (datac[(i<<2) + 1] << 8) | datac[(i<<2) + 0]) || 0xffff;
+  }
+  return tile;
+}
+
+var tiles = [];
+
+// ---------------------------------------------
+// Screen data
+
+var screendata =
+{
+    canvas:    null,
+    context:   null,
+    imagedata: null,
+
+    bufarray:  null, // color data
+    buf8:      null, // the same array but with bytes
+    buf32:     null, // the same array but with 32-Bit words
+
+    backgroundcolor: 0xFF990000
+};
+
+// ---------------------------------------------
+// Keyboard and mouse interaction
+
+var input =
+{
+    forwardbackward: 0,
+    leftright:       0,
+    updown:          0,
+    lookup:          false,
+    lookdown:        false,
+    mouseposition:   null,
+    keypressed:      false
+}
+
+var updaterunning = false;
+
+var time = new Date().getTime();
+
+
+// for fps display
+var timelastframe = new Date().getTime();
+var frames = 0;
+
+function getTile(xx, yy) {
+    var x = Math.floor(xx / map.width);
+    var y = Math.floor(yy / map.height);
+    if(tiles[y] === undefined)
+        return null;
+    return tiles[y][x];
+}
+
+function ClearFar() {
+  var far = 3;
+  var lowx = Math.floor((camera.x - camera.distance * far) / map.width);
+  var lowy = Math.floor((camera.y - camera.distance * far) / map.height);
+  var highx = Math.floor((camera.x + camera.distance * far) / map.width);
+  var highy = Math.floor((camera.y + camera.distance * far) / map.height);
+
+  Object.keys(tiles).map(function(y){return parseInt(y);}).forEach(function(y){
+    if(y < lowy || y > highy){
+      delete tiles[y];
+    }else{
+       Object.keys(tiles[y]).map(function(x){return parseInt(x);}).forEach(
+          function(x){
+            if(x < lowx || x > highx) delete tiles[y][x];
+          });
+    }
+  });
+}
+
+var loading = [];
+
+function FetchNear() {
+  var near = 2.0;
+
+  var lowx = Math.floor((camera.x - camera.distance * near) / map.width);
+  var lowy = Math.floor((camera.y - camera.distance * near) / map.height);
+  var highx = Math.floor((camera.x + camera.distance * near) / map.width);
+  var highy = Math.floor((camera.y + camera.distance * near) / map.height);
+
+  for(var y = lowy; y <= highy; y++) {
+    for(var x = lowx; x <= highx; x++) {
+      if(tiles[y] && tiles[y][x]) {
+        continue;
+      }
+      var urls = getUrlsForImage(x,y);
+      urls = urls ? Array.isArray(urls)? urls : [urls] : null;
+      if(urls == null || urls.length == 0) continue;
+      if(loading.indexOf(urls[0]) < 0) {
+        loading.push(urls[0]);
+        console.log("loading tile " + urls[0]);
+
+        LoadMap(x, y, urls, function(urls) {
+          var idx = loading.indexOf(urls[0]);
+          loading.splice(idx, 1);
+        }.bind(null,urls));
+      }
+    }
+  }
+}
+
+// Update the camera for next frame. Dependent on keypresses
+function UpdateCamera()
+{
+    var current = new Date().getTime();
+
+    input.keypressed = false;
+    if (input.leftright != 0)
+    {
+        camera.angle += input.leftright*0.1*(current-time)*0.03;
+        input.keypressed = true;
+    }
+    if (input.forwardbackward != 0)
+    {
+        camera.x -= input.forwardbackward * Math.sin(camera.angle) * (current-time)*0.03;
+        camera.y -= input.forwardbackward * Math.cos(camera.angle) * (current-time)*0.03;
+        input.keypressed = true;
+    }
+    if (input.updown != 0)
+    {
+        camera.height += input.updown * (current-time)*0.03;
+        input.keypressed = true;
+    }
+    if (input.lookup)
+    {
+        camera.horizon += 2 * (current-time)*0.1;
+        input.keypressed = true;
+    }
+    if (input.lookdown)
+    {
+        camera.horizon -= 2 * (current-time)*0.1;
+        input.keypressed = true;
+    }
+
+    // Collision detection. Don't fly below the surface.
+    var mapoffset = ((Math.floor(camera.y) & (map.width-1)) << map.shift) + (Math.floor(camera.x) & (map.height-1))|0;
+    var cameraHeight = 200;
+    var tile = getTile(camera.x, camera.y);
+    if (tile && (tile.altitude[mapoffset]+cameraHeight) > camera.height) camera.height = tile.altitude[mapoffset] + cameraHeight;
+
+    time = current;
+
+}
+
+// ---------------------------------------------
+// Keyboard and mouse event handlers
+// ---------------------------------------------
+// Keyboard and mouse event handlers
+
+function GetMousePosition(e)
+{
+    // fix for Chrome
+    if (e.type.startsWith('touch'))
+    {
+        return [e.targetTouches[0].pageX, e.targetTouches[0].pageY];
+    } else
+    {
+        return [e.pageX, e.pageY];
+    }
+}
+
+
+function DetectMouseDown(e)
+{
+    input.forwardbackward = 6.;
+    input.mouseposition = GetMousePosition(e);
+    time = new Date().getTime();
+
+    if (!updaterunning) Draw();
+    return;
+}
+
+function DetectMouseUp()
+{
+    input.mouseposition = null;
+    input.forwardbackward = 0;
+    input.leftright = 0;
+    input.updown = 0;
+    return;
+}
+
+function DetectMouseMove(e)
+{
+    e.preventDefault();
+    if (input.mouseposition == null) return;
+    if (input.forwardbackward == 0) return;
+
+    var currentMousePosition = GetMousePosition(e);
+
+    input.leftright = (input.mouseposition[0] - currentMousePosition[0]) / window.innerWidth * 2;
+    camera.horizon  = 100 + (input.mouseposition[1] - currentMousePosition[1]) / window.innerHeight * 500;
+    input.updown    = (input.mouseposition[1] - currentMousePosition[1]) / window.innerHeight * 2000;
+}
+
+
+function DetectKeysDown(e)
+{
+    switch(e.keyCode)
+    {
+    case 37:    // left cursor
+    case 65:    // a
+        input.leftright = +1.;
+        break;
+    case 39:    // right cursor
+    case 68:    // d
+        input.leftright = -1.;
+        break;
+    case 38:    // cursor up
+    case 87:    // w
+        input.forwardbackward = 3.;
+        break;
+    case 40:    // cursor down
+    case 83:    // s
+        input.forwardbackward = -3.;
+        break;
+    case 82:    // r
+        input.updown = +200.;
+        break;
+    case 70:    // f
+        input.updown = -200.;
+        break;
+    case 69:    // e
+        input.lookup = true;
+        break;
+    case 81:    //q
+        input.lookdown = true;
+        break;
+    default:
+        return;
+        break;
+    }
+
+    if (!updaterunning) {
+        time = new Date().getTime();
+        Draw();
+    }
+    return false;
+}
+
+function DetectKeysUp(e)
+{
+    switch(e.keyCode)
+    {
+    case 37:    // left cursor
+    case 65:    // a
+        input.leftright = 0;
+        break;
+    case 39:    // right cursor
+    case 68:    // d
+        input.leftright = 0;
+        break;
+    case 38:    // cursor up
+    case 87:    // w
+        input.forwardbackward = 0;
+        break;
+    case 40:    // cursor down
+    case 83:    // s
+        input.forwardbackward = 0;
+        break;
+    case 82:    // r
+        input.updown = 0;
+        input.updown = 0;
+        break;
+    case 70:    // f
+        break;
+    case 69:    // e
+        input.lookup = false;
+        break;
+    case 81:    //q
+        input.lookdown = false;
+        break;
+    default:
+        return;
+        break;
+    }
+    return false;
+}
+
+// ---------------------------------------------
+// Fast way to draw vertical lines
+
+function DrawVerticalLine(x, ytop, ybottom, col)
+{
+    x = x|0;
+    ytop = ytop|0;
+    ybottom = ybottom|0;
+    col = col|0;
+    var buf32 = screendata.buf32;
+    var screenwidth = screendata.canvas.width|0;
+    if (ytop < 0) ytop = 0;
+    if (ytop > ybottom) return;
+
+    // get offset on screen for the vertical line
+    var offset = ((ytop * screenwidth) + x)|0;
+    for (var k = ytop|0; k < ybottom|0; k=k+1|0)
+    {
+        buf32[offset|0] = col|0;
+        offset = offset + screenwidth|0;
+    }
+}
+
+// ---------------------------------------------
+// Basic screen handling
+
+function DrawBackground()
+{
+    var buf32 = screendata.buf32;
+    var color = screendata.backgroundcolor|0;
+    for (var i = 0; i < buf32.length; i++) buf32[i] = color|0;
+}
+
+// Show the back buffer on screen
+function Flip()
+{
+    screendata.imagedata.data.set(screendata.buf8);
+    screendata.context.putImageData(screendata.imagedata, 0, 0);
+}
+
+// ---------------------------------------------
+// The main render routine
+
+function Render()
+{
+    var mapwidthperiod = map.width - 1;
+    var mapheightperiod = map.height - 1;
+
+    var screenwidth = screendata.canvas.width|0;
+    var sinang = Math.sin(camera.angle);
+    var cosang = Math.cos(camera.angle);
+
+    var hiddeny = new Int32Array(screenwidth);
+    for(var i=0; i<screendata.canvas.width|0; i=i+1|0)
+        hiddeny[i] = screendata.canvas.height;
+
+    var dz = 1.;
+
+    // Draw from front to back
+    for(var z=1; z<camera.distance; z+=dz)
+    {
+        // 90 degree field of view
+        var plx =  -cosang * z - sinang * z;
+        var ply =   sinang * z - cosang * z;
+        var prx =   cosang * z - sinang * z;
+        var pry =  -sinang * z - cosang * z;
+
+        var dx = (prx - plx) / screenwidth;
+        var dy = (pry - ply) / screenwidth;
+        plx += camera.x;
+        ply += camera.y;
+        var invz = 1. / z * (.0 + map.zfactor || 240.);
+        for(var i=0; i<screenwidth|0; i=i+1|0)
+        {
+            var tile = getTile(plx, ply);
+            if(tile) {
+                var mapoffset = ((Math.floor(ply) & mapwidthperiod) << map.shift) + (Math.floor(plx) & mapheightperiod)|0;
+                var heightonscreen = (camera.height - tile.altitude[mapoffset]) * invz + camera.horizon|0;
+                DrawVerticalLine(i, heightonscreen|0, hiddeny[i], tile.color[mapoffset]);
+                if (heightonscreen < hiddeny[i]) {
+                  hiddeny[i] = heightonscreen;
+                }
+            }
+
+            plx += dx;
+            ply += dy;
+        }
+      //dz += 0.01;
+    }
+}
+
+
+// ---------------------------------------------
+// Draw the next frame
+
+function Draw()
+{
+    updaterunning = true;
+    UpdateCamera();
+    FetchNear();
+    DrawBackground();
+    Render();
+    window.requestAnimationFrame(function(){
+      Flip();
+      frames++;
+
+      if (!input.keypressed)
+      {
+          updaterunning = false;
+      } else
+      {
+          window.setTimeout(Draw, 0);
+      }
+    });
+}
+
+// ---------------------------------------------
+// Init routines
+
+// Util class for downloading the png
+function DownloadImagesAsync(urls, OnSuccess) {
+    var pending = urls.length;
+    var result = [];
+    OnSuccess = OnSuccess.bind(null, result);
+    if (pending === 0) {
+        setTimeout(OnSuccess, 0);
+        return;
+    }
+    var onLoad = function(image, i) {
+        var tempcanvas = document.createElement("canvas");
+        var tempcontext = tempcanvas.getContext("2d");
+        tempcanvas.width = map.width;
+        tempcanvas.height = map.height;
+        tempcontext.drawImage(image, 0, 0, map.width, map.height);
+        result[i] = tempcontext.getImageData(0, 0, map.width, map.height).data;
+        pending--;
+        if (pending === 0) {
+            if(map.hillshade){
+              result[0] = getHillshadedImageData(result[0],(result.length === 1 ? result[0]: result[1]),map.width,map.height);
+            }
+            setTimeout(OnSuccess, 0);
+        }
+    }
+
+    urls.forEach(function(url, i) {
+        var image = new Image();
+        //image.addEventListener("load", function() {
+        image.onload = onLoad.bind(null,image,i);
+        image.crossOrigin = "anonymous";
+        image.src = url;
+    });
+}
+
+
+function LoadMap(x, y, urls, callback)
+{
+    DownloadImagesAsync(urls, function(x,y,images) {
+        console.log("loaded " + x + ", " + y)
+        if(!tiles[y])
+            tiles[y] = [];
+        tiles[y][x] = imagesToTile(images,x,y);
+        if(callback) {
+          callback();
+        }
+        Draw();
+    }.bind(null,x,y));
+}
+
+
+function OnResizeWindow()
+{
+    screendata.canvas = document.getElementById('myCanvas');
+
+    var aspect = window.innerWidth / window.innerHeight;
+
+    screendata.canvas.width = window.innerWidth<800?window.innerWidth:800;
+    screendata.canvas.height = screendata.canvas.width / aspect;
+
+    if (screendata.canvas.getContext)
+    {
+        screendata.context = screendata.canvas.getContext('2d');
+        screendata.imagedata = screendata.context.createImageData(screendata.canvas.width, screendata.canvas.height);
+    }
+
+    screendata.bufarray = new ArrayBuffer(screendata.imagedata.width * screendata.imagedata.height * 4);
+    screendata.buf8     = new Uint8Array(screendata.bufarray);
+    screendata.buf32    = new Uint32Array(screendata.bufarray);
+    Draw();
+}
+
+function Init()
+{
+    OnResizeWindow();
+
+    // set event handlers for keyboard, mouse, touchscreen and window resize
+    document.onkeydown    = DetectKeysDown;
+    document.onkeyup      = DetectKeysUp;
+    document.onmousedown  = DetectMouseDown;
+    document.onmouseup    = DetectMouseUp;
+    document.onmousemove  = DetectMouseMove;
+    document.ontouchstart = DetectMouseDown;
+    document.ontouchend   = DetectMouseUp;
+    document.ontouchmove  = DetectMouseMove;
+    window.onresize       = OnResizeWindow;
+
+    window.setInterval(function(){
+        var current = new Date().getTime();
+        document.getElementById('fps').innerText = (frames / (current-timelastframe) * 1000).toFixed(1) + " fps";
+        frames = 0;
+        timelastframe = current;
+
+      ClearFar();
+    }, 2000);
+
+}
+
+Init();
+
+</script>
+
+</body>
